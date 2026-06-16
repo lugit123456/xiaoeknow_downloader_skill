@@ -1,0 +1,114 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Xiaoeknow Downloader Skill",
+    "description": "小鹅通课程抓取技能。接收课程链接，自动下载视频/音频并做 ASR 语音转录（繁体转简体），支持断点续传和 6 小时心跳保活。",
+    "version": "3.0.0"
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8000",
+      "description": "本地抓取服务"
+    }
+  ],
+  "paths": {
+    "/download": {
+      "post": {
+        "operationId": "run_crawler_pipeline",
+        "summary": "启动小鹅通抓取任务",
+        "description": "传入课程 URL，系统自动下载视频/音频并完成 ASR 简体转录。支持客户直达模式（直接抓取）和断点续传模式（从数据库领用任务）。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "target_url": {
+                    "type": "string",
+                    "description": "小鹅通课程链接，格式为 https://xxx.h5.xiaoeknow.com/..."
+                  },
+                  "direct_mode": {
+                    "type": "boolean",
+                    "description": "客户直达模式。true（默认）：直接抓取用户提供的 URL，不查表不写任务表。false：从数据库积压任务领用，支持断点续传。"
+                  }
+                },
+                "required": ["target_url"]
+              },
+              "example": {
+                "target_url": "https://xxx.h5.xiaoeknow.com/...",
+                "direct_mode": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "抓取任务执行结果",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": ["success", "error"],
+                      "description": "任务执行状态"
+                    },
+                    "msg": {
+                      "type": "string",
+                      "description": "状态信息或错误详情"
+                    },
+                    "course_name": {
+                      "type": "string",
+                      "description": "当前处理的课程名称"
+                    },
+                    "stats": {
+                      "type": "object",
+                      "description": "抓取统计信息",
+                      "properties": {
+                        "total": {
+                          "type": "integer",
+                          "description": "课程总资源数"
+                        },
+                        "downloaded": {
+                          "type": "array",
+                          "items": {"type": "string"},
+                          "description": "本次成功下载并转录的资源列表"
+                        },
+                        "skipped": {
+                          "type": "array",
+                          "items": {"type": "string"},
+                          "description": "数据库已存在而跳过的资源列表"
+                        },
+                        "failed": {
+                          "type": "array",
+                          "items": {"type": "string"},
+                          "description": "下载或转录失败的资源列表"
+                        }
+                      }
+                    }
+                  }
+                },
+                "example": {
+                  "status": "success",
+                  "course_name": "Python 入门到精通",
+                  "msg": "",
+                  "stats": {
+                    "total": 10,
+                    "downloaded": ["第1课", "第2课", "第3课"],
+                    "skipped": ["第4课", "第5课"],
+                    "failed": []
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "服务内部错误"
+          }
+        }
+      }
+    }
+  }
+}
