@@ -17,14 +17,14 @@
 
 ```
 xiaoeknow_downloader_skill/
-├── xe_crawler.py          # 核心抓取引擎（交互式 CLI 入口）
+├── xe_crawler.py          # 核心抓取引擎（交互式 CLI 入口，含登录/抓取/入库/ASR/保活）
 ├── api_server.py          # FastAPI 服务端（API 入口）
 ├── init_setup.py          # 数据库初始化脚本
-├── xiaoeknow_trigger.py   # 快速触发入口（AI Agent 调用）
 ├── manifest.json          # OpenAPI 规范（用于 Agent 平台接入）
 ├── requirements.txt       # Python 依赖
 ├── SKILL.md               # Skill 说明文档
 ├── SKILL_SETUP.md         # 环境配置指南
+├── .env.example           # 环境变量模板
 └── README.md              # 本文档
 ```
 
@@ -86,13 +86,7 @@ COOKIE_FILE=./xe_cookies.json
 .venv/bin/python xe_crawler.py
 ```
 
-直接运行，通过命令行交互下载。
-
-### 快速触发（AI Agent 调用）
-
-```bash
-.venv/bin/python xiaoeknow_trigger.py <小鹅通课程链接>
-```
+直接运行。启动时会**自动从 `xiaoetong_crawl_targets` 队列中按 `id ASC` 顺序拉取所有 `is_enabled=TRUE AND is_fully_crawled=FALSE` 的待抓取任务**，逐条处理直到队列空。然后进入 `while True` 交互模式，用户可直接输入新链接。
 
 ## API 接口说明
 
@@ -134,12 +128,17 @@ COOKIE_FILE=./xe_cookies.json
 
 | 特性 | 说明 |
 |------|------|
-| 客户直达模式 | 用户直接提供链接，无需注册到数据库，直接抓取 |
-| 断点续传 | 数据库已存在的资源自动跳过，不重复下载 |
+| 客户直达模式 | 用户直接提供链接，**自动建档入库**（写入 `xiaoetong_crawl_targets` + `xiaoetong_crawled_data`），支持断点续传 |
+| CLI 自驱消费队列 | `xe_crawler.py` 启动后按 `id ASC` 顺序消费整个待抓取队列 |
+| 断点续传 | 数据库已存在的资源（`resource_id` 命中）自动跳过，日志打印 `⏭️ 数据库已存在 resource_id=... 跳过（断点续传）` |
+| 三信号登录检测 | Cookie 名 / URL 跳离登录页 / localStorage token，任一命中即视为登录成功，扫码后秒级续跑 |
+| 智能入库门 | 视频（.mp4）或音频（.mp3）任一成功即入库；ASR 优先用音频（更快） |
+| 空目录识别 | 课程目录 API 返回空 list 时 `last_crawl_status` 标 `empty`，不伪装成 `success` |
 | 双轨克隆 | 视频（.mp4）和音频（.mp3）同步下载 |
 | ASR 简体转录 | Whisper 语音识别 + OpenCC 繁体转简体，100% 纯简体入库 |
 | 6 小时心跳保活 | 一次登录，无限续航，自动续命 Cookie |
 | 文件名清理 | 自动清理特殊字符，确保文件可正常存储 |
+| Cookie 自动锚定 | `COOKIE_FILE` 填相对路径时自动锚定到 skill 目录，跨进程跑也不会找不到 |
 
 ## 数据库表说明
 
@@ -155,10 +154,10 @@ COOKIE_FILE=./xe_cookies.json
 | is_enabled | BOOLEAN | 是否启用 |
 | crawl_frequency | INT | 抓取频率 |
 | last_crawl_time | TIMESTAMP | 最后抓取时间 |
-| last_crawl_status | VARCHAR(50) | 最后抓取状态 |
+| last_crawl_status | VARCHAR(50) | 最后抓取状态。枚举值：`init`（建档）/ `running`（执行中）/ `success`（成功）/ `empty`（课程目录为空）/ `failed`（失败，详见 `failure_reason`） |
 | crawled_count | INT | 已抓取数量 |
 | is_fully_crawled | BOOLEAN | 是否已全量抓取 |
-| failure_reason | TEXT | 失败原因 |
+| failure_reason | TEXT | 失败原因（如 `empty` 状态时为"未获取到任何课程目录节点"；鉴权失败时为接口返回的 msg） |
 | remarks | TEXT | 备注 |
 | created_at | TIMESTAMP | 创建时间 |
 
@@ -179,7 +178,10 @@ COOKIE_FILE=./xe_cookies.json
 
 | 问题 | 解决方案 |
 |------|---------|
-| "Cookie 无效或已过期" | 运行 `xe_crawler.py`，按提示重新扫码登录 |
-| "NAS 目录不可用" | 检查 `XIAOE_DOWNLOAD_DIR` 路径是否正确配置 |
-| "数据库连接失败" | 检查 PostgreSQL 是否运行，确认 `.env` 配置正确 |
-| "FFmpeg 异常" | 确认 ffmpeg 已安装并配置到系统环境变量 |
+| "Cookie 无效或已过期" | 删除 skill 目录下的 `xe_cookies.json` 后运行 `xe_crawler.py`，按提示重新扫码登录 |
+| 扫码后停 5 分钟不自动续跑 | 看控制台 30 秒一次的 `[调试] 轮询 #Ns cookies=[...] url=...` 日志，把小鹅通实际种下的真实 cookie 名加到 `xe_crawler.py` 的 `real_auth_names` 元组里 |
+| 第二次跑同一 URL 没新增数据 | 日志出现 `⏭️ 数据库已存在 resource_id=... 跳过（断点续传）` 表示符合预期，断点续传不会重复入库 |
+| `last_crawl_status=empty` | 课程目录 API 返回空 list，可能课程未公开或鉴权失效；查同行的 `failure_reason` 列 |
+| "NAS 目录不可用" | 检查 `XIAOE_DOWNLOAD_DIR` 路径是否正确配置；不可写时会自动 fallback 到 `<skill_dir>/xiaoe_downloads` |
+| "数据库连接失败" | 检查 PostgreSQL 是否运行，确认 `.env` 中 `POSTGRES_*` 变量配置正确 |
+| "FFmpeg 异常" | 确认 ffmpeg 已安装并配置到系统环境变量（`which ffmpeg`） |

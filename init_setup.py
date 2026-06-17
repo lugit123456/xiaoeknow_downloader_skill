@@ -100,6 +100,40 @@ def init_xiaoetong_tables():
         conn.close()
 
 
+def upsert_target_by_url(cursor, target_url, app_id, course_id):
+    """
+    根据 target_url 原子地获取或创建一条 xiaoetong_crawl_targets 记录。
+    cursor 必须是 psycopg2.extras.DictCursor，否则 fetchone() 返回的是 tuple。
+    返回：DictRow | None（异常时返回 None，调用方决定是否 fallback）。
+    """
+    from psycopg2.extras import DictCursor
+    if not isinstance(cursor, DictCursor):
+        raise TypeError("upsert_target_by_url 要求传入 DictCursor 实例")
+
+    try:
+        cursor.execute(
+            "SELECT * FROM xiaoetong_crawl_targets WHERE target_url = %s",
+            (target_url,)
+        )
+        existing = cursor.fetchone()
+        if existing:
+            return existing
+
+        cursor.execute(
+            '''
+            INSERT INTO xiaoetong_crawl_targets (target_url, app_id, course_id, last_crawl_status)
+            VALUES (%s, %s, %s, 'init')
+            ON CONFLICT (target_url) DO UPDATE SET target_url = EXCLUDED.target_url
+            RETURNING *
+            ''',
+            (target_url, app_id, course_id)
+        )
+        return cursor.fetchone()
+    except Exception as e:
+        print(f"✗ upsert_target_by_url 失败: {e}")
+        return None
+
+
 if __name__ == "__main__":
     success = init_xiaoetong_tables()
     sys.exit(0 if success else 1)

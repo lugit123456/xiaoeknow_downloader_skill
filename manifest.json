@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Xiaoeknow Downloader Skill",
-    "description": "小鹅通课程抓取技能。接收课程链接，自动下载视频/音频并做 ASR 语音转录（繁体转简体），支持断点续传和 6 小时心跳保活。",
+    "description": "小鹅通课程抓取技能。接收课程链接，自动下载视频/音频并做 ASR 语音转录（繁体转简体），支持断点续传、6 小时心跳保活和三信号扫码登录检测。客户直达模式（direct_mode=true）会自动在 xiaoetong_crawl_targets 建档并写入 xiaoetong_crawled_data。",
     "version": "3.0.0"
   },
   "servers": [
@@ -16,7 +16,7 @@
       "post": {
         "operationId": "run_crawler_pipeline",
         "summary": "启动小鹅通抓取任务",
-        "description": "传入课程 URL，系统自动下载视频/音频并完成 ASR 简体转录。支持客户直达模式（直接抓取）和断点续传模式（从数据库领用任务）。",
+        "description": "传入课程 URL，系统自动下载视频/音频并完成 ASR 简体转录。客户直达模式（direct_mode=true，默认）会自动在 xiaoetong_crawl_targets 建档并把抓取数据写入 xiaoetong_crawled_data；断点续传模式（direct_mode=false）从数据库领用任务并跳过已存在资源。",
         "requestBody": {
           "required": true,
           "content": {

@@ -82,6 +82,7 @@ fi
 | POSTGRES_PASSWORD | 数据库用户密码 | hub_password |
 | POSTGRES_DB | 数据库名称（所有爬虫汇聚于此） | financial_hub |
 | XIAOE_DOWNLOAD_DIR | NAS 文件存储根目录 | /Volumes/nas/xiaoeknow_data/downloads |
+| COOKIE_FILE | Cookie 缓存文件路径。**若填相对路径则自动锚定到 skill 目录**(避免跨进程跑时找不到文件)。删除该文件即强制重新扫码。 | ./xe_cookies.json |
 
 ## Step 4: Verify setup & Initialize database table
 
@@ -92,6 +93,20 @@ fi
 ```
 
 如果上述命令成功输出 `✓ Database connection successful!`，则代表该 Skill 的运行环境与底层数据表全部就绪。
+
+如需重置登录授权，删除 skill 目录下的 `xe_cookies.json` 文件后再启动 `xe_crawler.py` 即可触发重新扫码。
+
+## 登录检测说明
+
+`login_and_save_cookies`（位于 `xe_crawler.py`）采用**多信号策略**判断扫码登录是否成功，命中任一信号即视为登录成功并自动续跑，无需依赖单一 cookie 名：
+
+| 信号 | 说明 |
+|------|------|
+| ① Cookie 名称 | 命中关键字 `uid` / `user_token` / `openid` / `unionid` / `session_token` / `phone` / `email` / `user_id` / `token_type` / `p_token` / `xet_token` / `xiaoeknow_token` / `token`,且 cookie 名不含 `anony` |
+| ② URL 跳离 | 浏览器页面从 `passport.xiaoeknow.com` / 登录页跳回 `h5.xiaoeknow.com` 目标域 |
+| ③ localStorage | 页面 `localStorage` / `sessionStorage` 中存在 `token` / `userToken` / `user_token` / `access_token` / `p_token` / `uid` / `xet_token` / `xiaoeknow_token` 等键(值长度 > 4) |
+
+**排查指南**：控制台每 30 秒会打印一行 `[调试] 轮询 #Ns cookies=[...] url=...`。如果扫码后停 5 分钟超时，看这一行就能看到小鹅通实际种下的 cookie 名是什么，把它加到 `real_auth_names` 元组里即可命中信号 ①。信号 ② 和 ③ 通常 1~2 秒内就会触发，扫码后秒级续跑是正常表现。
 
 ## 使用方法
 
@@ -140,10 +155,14 @@ python xe_crawler.py
 
 ### 核心特性
 
-- **客户直达模式**：用户直接提供链接时，无需注册到数据库，直接抓取，文件保存到 NAS
-- **断点续传**：数据库已存在的资源自动跳过，不重复下载
+- **客户直达模式**：用户直接提供链接时，自动在 `xiaoetong_crawl_targets` 建档并写入 `xiaoetong_crawled_data`，支持断点续传
+- **CLI 自驱消费队列**：`python xe_crawler.py` 启动后自动按 `id ASC` 顺序消费所有 `is_enabled=TRUE AND is_fully_crawled=FALSE` 的待抓取任务，单条任务失败时停止整条队列（避免被同一错误反复阻塞）
+- **断点续传**：数据库已存在的资源（`xiaoetong_crawled_data.resource_id` 命中）自动跳过，不重复下载；日志会打印 `⏭️ 数据库已存在 resource_id=... 跳过（断点续传）` 提示
 - **双轨克隆**：视频（.mp4）和音频（.mp3）同步下载
+- **智能入库门**：视频和音频任一成功即入库；ASR 优先用音频（更快），其次用视频
+- **空目录识别**：课程目录 API 返回空 list 时，`last_crawl_status` 标 `empty` 并写入 `failure_reason`，不会伪装成 `success`
 - **ASR 简体转录**：Whisper 语音识别 + OpenCC 繁体转简体，100% 纯简体入库
+- **三信号登录检测**：Cookie 名 / URL 跳离 / localStorage token，任一命中即视为登录成功
 - **6 小时心跳保活**：一次登录，无限续航，自动续命 Cookie
 
 ### .env 变量说明

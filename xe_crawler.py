@@ -20,7 +20,8 @@ load_dotenv()
 # ==========================================
 # 全局配置
 # ==========================================
-COOKIE_FILE = os.getenv("COOKIE_FILE", "xe_cookies.json")
+_cookie_file_raw = os.getenv("COOKIE_FILE", "xe_cookies.json")
+COOKIE_FILE = _cookie_file_raw if os.path.isabs(_cookie_file_raw) else os.path.join(os.path.dirname(__file__), _cookie_file_raw)
 
 # NAS 文件存储路径（支持绝对路径）
 _xiaoe_download_dir = os.getenv("XIAOE_DOWNLOAD_DIR", "/Volumes/nas/xiaoeknow_data/downloads")
@@ -78,7 +79,7 @@ def transcribe_audio(filepath):
     return simplified_text
 
 
-from init_setup import init_xiaoetong_tables, get_db_connection
+from init_setup import init_xiaoetong_tables, get_db_connection, upsert_target_by_url
 
 
 # ==========================================
@@ -98,7 +99,79 @@ def login_and_save_cookies(url):
         context = browser.new_context()
         page = context.new_page()
         page.goto(url)
-        input("[系统提示] 登录成功后，回到此控制台按【Enter】键继续...")
+
+        # 自动检测登录完成：采用多信号策略
+        #   1) Cookie 名称匹配真正的登录关键字
+        #   2) 页面 URL 跳离小鹅通登录中心
+        #   3) localStorage / sessionStorage 中存在 token
+        # 任一满足即视为登录成功
+        initial_url = page.url
+        print(f"[系统提示] 等待扫码登录（5 分钟超时），初始 URL: {initial_url}")
+
+        # 真正的登录 Cookie 名称关键字（不能是 anony_token）
+        real_auth_names = ('uid', 'user_token', 'openid', 'unionid', 'session_token',
+                          'phone', 'email', 'user_id', 'token_type',
+                          'p_token', 'xet_token', 'xiaoeknow_token', 'token')
+
+        for i in range(300):
+            time.sleep(1)
+            current = context.cookies()
+            current_url = page.url
+
+            # 信号 1：Cookie 名称命中
+            real_auth = any(
+                any(k in c.get('name', '').lower() for k in real_auth_names)
+                and 'anony' not in c.get('name', '').lower()
+                for c in current
+            )
+
+            # 信号 2：URL 跳离登录页（跳到 h5.xiaoeknow.com 目标域，且不再是登录中心）
+            url_left_login = (
+                'h5.xiaoeknow.com' in current_url.lower()
+                and 'passport' not in current_url.lower()
+                and 'login' not in current_url.lower()
+                and current_url != initial_url
+            )
+
+            # 信号 3：localStorage / sessionStorage 中存在常见 token 字段
+            storage_auth = False
+            try:
+                storage_auth = page.evaluate("""
+                    () => {
+                        const keys = ['token','userToken','user_token','access_token',
+                                      'p_token','uid','xet_token','xiaoeknow_token'];
+                        for (const store of [localStorage, sessionStorage]) {
+                            try {
+                                for (const k of keys) {
+                                    const v = store.getItem(k);
+                                    if (v && v.length > 4) return true;
+                                }
+                            } catch(e) {}
+                        }
+                        return false;
+                    }
+                """)
+            except Exception:
+                # localStorage 不可用时（如跨域 iframe 内）静默忽略
+                pass
+
+            # 每 30 秒打印一次调试快照，方便排查
+            if i % 30 == 0:
+                cookie_names = [c.get('name', '') for c in current]
+                print(f"[调试] 轮询 #{i}s cookies={cookie_names} url={current_url}")
+
+            if real_auth or url_left_login or storage_auth:
+                reasons = []
+                if real_auth:   reasons.append("cookie匹配")
+                if url_left_login: reasons.append("URL跳离登录页")
+                if storage_auth: reasons.append("localStorage有token")
+                print(f"[系统提示] 登录成功（{ ' / '.join(reasons) }），继续。")
+                break
+        else:
+            print("❌ [系统提示] 登录超时（5 分钟未检测到登录态）。")
+            browser.close()
+            raise TimeoutError("登录超时：请在 5 分钟内完成扫码")
+
         cookies = context.cookies()
         with open(COOKIE_FILE, 'w', encoding='utf-8') as f:
             json.dump(cookies, f)
@@ -236,41 +309,42 @@ def run_download_task(target_url, target_id=None, direct_mode=False):
     db_target_id = None
 
     # ============================================
-    # 【客户直达模式】直接抓取，不查表不写表
+    # 【统一入口】始终 upsert 一条 target 记录
+    # direct_mode 路径下也复用/新建 target，使每条抓取都可入库
     # ============================================
-    if not direct_mode:
-        # 1. 任务锁定与状态检查
-        if target_id:
-            cur.execute("SELECT * FROM xiaoetong_crawl_targets WHERE id = %s", (target_id,))
-            target_record = cur.fetchone()
-        else:
-            cur.execute("SELECT * FROM xiaoetong_crawl_targets WHERE target_url = %s", (target_url,))
-            target_record = cur.fetchone()
-
-        if target_record:
-            if not target_record['is_enabled']:
-                cur.close()
-                conn.close()
-                return {"status": "error", "msg": "该目标任务在数据库中已被停用。"}
-            if target_record['is_fully_crawled']:
-                cur.close()
-                conn.close()
-                return {"status": "success", "course_name": target_record['course_name'],
-                        "msg": "✅ 目标已处于全量抓取完毕状态，无需重复执行。"}
-            db_target_id = target_record['id']
-        else:
-            cur.execute('''
-                INSERT INTO xiaoetong_crawl_targets (target_url, app_id, course_id, last_crawl_status)
-                VALUES (%s, %s, %s, 'init') RETURNING id
-            ''', (target_url, app_id, course_id))
-            db_target_id = cur.fetchone()[0]
-            conn.commit()
-
-        cur.execute("UPDATE xiaoetong_crawl_targets SET last_crawl_time = %s, last_crawl_status = 'running' WHERE id = %s",
-                    (datetime.now(), db_target_id))
-        conn.commit()
+    if target_id:
+        cur.execute("SELECT * FROM xiaoetong_crawl_targets WHERE id = %s", (target_id,))
+        target_record = cur.fetchone()
     else:
-        print(f"\n[客户直达模式] 直接抓取 URL，不查询/更新数据库任务表。")
+        target_record = upsert_target_by_url(cur, target_url, app_id, course_id)
+
+    if target_record:
+        if not target_record['is_enabled']:
+            cur.close()
+            conn.close()
+            return {"status": "error", "msg": "该目标任务在数据库中已被停用。"}
+        if target_record['is_fully_crawled'] and not direct_mode:
+            cur.close()
+            conn.close()
+            return {"status": "success", "course_name": target_record['course_name'],
+                    "msg": "✅ 目标已处于全量抓取完毕状态，无需重复执行。"}
+        db_target_id = target_record['id']
+    else:
+        cur.execute('''
+            INSERT INTO xiaoetong_crawl_targets (target_url, app_id, course_id, last_crawl_status)
+            VALUES (%s, %s, %s, 'init') RETURNING id
+        ''', (target_url, app_id, course_id))
+        db_target_id = cur.fetchone()[0]
+        conn.commit()
+        cur.execute("SELECT * FROM xiaoetong_crawl_targets WHERE id = %s", (db_target_id,))
+        target_record = cur.fetchone()
+
+    cur.execute("UPDATE xiaoetong_crawl_targets SET last_crawl_time = %s, last_crawl_status = 'running' WHERE id = %s",
+                (datetime.now(), db_target_id))
+    conn.commit()
+
+    if direct_mode:
+        print(f"\n[客户直达模式] 已自动建档 (target_id={db_target_id})，抓取结果将入库。")
 
     # 2. 网络交互与鉴权
     cookies_list = load_cookies()
@@ -291,10 +365,9 @@ def run_download_task(target_url, target_id=None, direct_mode=False):
     try:
         user_id = extract_user_id(cookies_list)
     except ValueError as e:
-        if not direct_mode:
-            cur.execute("UPDATE xiaoetong_crawl_targets SET last_crawl_status = 'failed', failure_reason = %s WHERE id = %s",
-                        (str(e), db_target_id))
-            conn.commit()
+        cur.execute("UPDATE xiaoetong_crawl_targets SET last_crawl_status = 'failed', failure_reason = %s WHERE id = %s",
+                    (str(e), db_target_id))
+        conn.commit()
         cur.close()
         conn.close()
         return {"status": "error", "msg": str(e)}
@@ -361,9 +434,8 @@ def run_download_task(target_url, target_id=None, direct_mode=False):
 
     course_name = safe_filename(info_res.get('data', {}).get('resource_name', "未命名课程_" + course_id))
 
-    if not direct_mode:
-        cur.execute("UPDATE xiaoetong_crawl_targets SET course_name = %s WHERE id = %s", (course_name, db_target_id))
-        conn.commit()
+    cur.execute("UPDATE xiaoetong_crawl_targets SET course_name = %s WHERE id = %s", (course_name, db_target_id))
+    conn.commit()
 
     # 确保下载目录存在
     course_dir = os.path.join(BASE_DOWNLOAD_DIR, course_name)
@@ -387,20 +459,19 @@ def run_download_task(target_url, target_id=None, direct_mode=False):
     stats = {"total": len(course_list), "downloaded": [], "skipped": [], "failed": []}
     print(f"\n[执行器] 开始处理《{course_name}》，共 {len(course_list)} 节内容...")
 
-    crawled_count = target_record['crawled_count'] if target_record and target_record['crawled_count'] else 0
+    crawled_count = (target_record['crawled_count'] or 0) if target_record else 0
 
     # 4. 循环解析、下载并存库
     for index, item in enumerate(course_list, start=1):
         title = safe_filename(item.get('resource_title', f'未命名_{index}'))
         r_id = item.get('resource_id')
 
-        # 断点续传校验（直接模式跳过）
-        if not direct_mode:
-            cur.execute("SELECT id FROM xiaoetong_crawled_data WHERE resource_id = %s", (r_id,))
-            if cur.fetchone():
-                stats["skipped"].append(title)
-                print(f"[{index:02d}] ⏭️ 数据库已存在记录，跳过: {title}")
-                continue
+        # 断点续传校验（所有模式都执行：direct_mode 也跳过已抓过的资源）
+        cur.execute("SELECT id FROM xiaoetong_crawled_data WHERE resource_id = %s", (r_id,))
+        if cur.fetchone():
+            stats["skipped"].append(title)
+            print(f"[{index:02d}] ⏭️ 数据库已存在 resource_id={r_id} 的记录，跳过（断点续传，不会重复入库）: {title}")
+            continue
 
         print(f"[{index:02d}] 正在处理: {title}")
         session.headers.update({'content-type': 'application/x-www-form-urlencoded'})
@@ -445,52 +516,58 @@ def run_download_task(target_url, target_id=None, direct_mode=False):
         # 只要任意一个介质下载成功，就允许入库
         if video_path_db or audio_path_db:
             transcript = ""
-            asr_target = video_path_db if video_path_db else audio_path_db
+            # ASR 优先用音频（更快），其次用视频
+            asr_target = audio_path_db if audio_path_db else video_path_db
             try:
                 transcript = transcribe_audio(asr_target)
             except Exception as e:
                 print(f"❌ 语音识别失败: {e}")
 
-            # 只有在非直接模式下才写入数据库
-            if not direct_mode:
-                cur.execute('''
-                    INSERT INTO xiaoetong_crawled_data (target_id, resource_id, resource_title, video_path, audio_path, transcription_text)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                ''', (db_target_id, r_id, title, video_path_db, audio_path_db, transcript))
+            # 写入数据库（所有模式都执行 — 修复 direct_mode=True 不入库的 bug）
+            cur.execute('''
+                INSERT INTO xiaoetong_crawled_data (target_id, resource_id, resource_title, video_path, audio_path, transcription_text)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            ''', (db_target_id, r_id, title, video_path_db, audio_path_db, transcript))
 
-                crawled_count += 1
-                cur.execute("UPDATE xiaoetong_crawl_targets SET crawled_count = %s WHERE id = %s", (crawled_count, db_target_id))
-                conn.commit()
+            crawled_count += 1
+            cur.execute("UPDATE xiaoetong_crawl_targets SET crawled_count = %s WHERE id = %s", (crawled_count, db_target_id))
+            conn.commit()
 
             stats["downloaded"].append(title)
+            media = []
+            if video_path_db: media.append("视频")
+            if audio_path_db: media.append("音频")
+            print(f"   ✅ 入库成功（{ '/'.join(media) }）: {title}")
         else:
             stats["failed"].append(title)
+            print(f"   ❌ 视频和音频均未下载成功，跳过入库: {title}")
 
         if index < len(course_list):
             time.sleep(random.uniform(5, 10))
 
-    # 5. 更新目标总状态（直接模式跳过）
-    if not direct_mode:
+    # 5. 更新目标总状态（所有模式都执行）
+    if stats["total"] == 0:
+        # 课程目录为空：标 empty，不要伪装成 success
+        cur.execute("UPDATE xiaoetong_crawl_targets SET last_crawl_status = 'empty', failure_reason = %s, is_fully_crawled = %s WHERE id = %s",
+                    ("未获取到任何课程目录节点（API 返回空 list）", False, db_target_id))
+    else:
         is_fully_crawled = (crawled_count >= stats["total"])
         cur.execute("UPDATE xiaoetong_crawl_targets SET last_crawl_status = 'success', is_fully_crawled = %s WHERE id = %s",
                     (is_fully_crawled, db_target_id))
-        conn.commit()
+    conn.commit()
 
     cur.close()
     conn.close()
 
+    print(f"\n[执行器] 《{course_name}》入库完成：新增 {len(stats['downloaded'])} 条，跳过 {len(stats['skipped'])} 条，失败 {len(stats['failed'])} 条。")
     return {"status": "success", "course_name": course_name, "stats": stats, "msg": ""}
 
 
 # ==========================================
 # 交互层：模拟自然语言 Skill Agent
 # ==========================================
-def chatbot_agent():
-    print("=======================================================")
-    print("🤖 你的私人小鹅通下载助手已上线！(含全量存储、ASR 简体及自动后台保活)")
-    print("=======================================================")
-
-    # 优先检索数据库中未完成的待抓取任务
+def _fetch_next_pending_task():
+    """从 DB 拉一条待抓取任务；队列空或异常时返回 None。"""
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=DictCursor)
     try:
@@ -503,33 +580,48 @@ def chatbot_agent():
             ORDER BY id ASC
             LIMIT 1
         ''')
-        pending_task = cur.fetchone()
+        return cur.fetchone()
     except Exception as e:
         print(f"⚠️ 检索待抓取任务异常: {e}")
-        pending_task = None
+        return None
     finally:
         cur.close()
         conn.close()
 
-    if pending_task:
-        task_id = pending_task['id']
-        task_url = pending_task['target_url']
-        display_name = pending_task['course_name'] if pending_task['course_name'] else task_url
 
-        print(f"\n⚡ [自动触发] 检测到数据库中有未完成的任务，直接开始抓取！")
-        print(f"📂 目标任务: {display_name}")
+def chatbot_agent():
+    print("=======================================================")
+    print("🤖 你的私人小鹅通下载助手已上线！(含全量存储、ASR 简体及自动后台保活)")
+    print("=======================================================")
+
+    # 优先检索数据库中未完成的待抓取任务（持续消费整个队列）
+    pending_task = _fetch_next_pending_task()
+    if pending_task:
+        print(f"\n⚡ [自动触发] 检测到数据库中有未完成的任务，开始按队列顺序抓取。")
         print("-------------------------------------------------------")
 
-        result = run_download_task(task_url, target_id=task_id)
+        while pending_task:
+            task_id = pending_task['id']
+            task_url = pending_task['target_url']
+            display_name = pending_task['course_name'] if pending_task['course_name'] else task_url
+            print(f"\n📂 当前任务: {display_name} (id={task_id})")
 
-        if result["status"] == "error":
-            print(f"🤖 助手系统消息: 自动抓取中止，错误原因: {result['msg']}\n")
-        else:
-            course_name = result["course_name"]
-            stats = result["stats"]
-            print(f"\n🎉 [自动完成] 《{course_name}》全链路处理完毕。")
-            print(
-                f"   - 📊 资源总计：{stats['total']} 个 | ✅ 新下载/转录：{len(stats['downloaded'])} 个 | ⏭️ 跳过：{len(stats['skipped'])} 个\n")
+            result = run_download_task(task_url, target_id=task_id)
+
+            if result["status"] == "error":
+                print(f"🤖 助手系统消息: 任务中止，错误原因: {result['msg']}")
+                # 当前任务失败，停止整条队列避免被同一错误反复阻塞
+                break
+            else:
+                course_name = result.get("course_name", display_name)
+                stats = result.get("stats", {})
+                if stats:
+                    print(f"\n🎉 [自动完成] 《{course_name}》全链路处理完毕。")
+                    print(
+                        f"   - 📊 资源总计：{stats.get('total', 0)} 个 | ✅ 新下载/转录：{len(stats.get('downloaded', []))} 个 | ⏭️ 跳过：{len(stats.get('skipped', []))} 个\n")
+
+            # 拉下一条
+            pending_task = _fetch_next_pending_task()
 
     print("ℹ️ 当前数据库中已无待抓取的活跃任务（或所有任务已全量抓取完毕）。")
     print("您可以对我说：'帮我下载这个资源：https://...' 或者直接发送新链接。")
